@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 
 /// Configuration for protobuf compilation
 #[derive(Debug)]
-pub(crate) enum CompileMode {
+pub enum CompileMode {
     // Do not use a protobuf compiler
     None,
     // Use external `protoc` binary with the given `args`
@@ -24,7 +24,7 @@ impl CompileMode {
     /// Append a `protoc` arg
     ///
     /// This ensures the mode is set to `protoc` overwriting any other mode.
-    pub(crate) fn append_protoc_arg<S>(&mut self, arg: S)
+    pub fn append_protoc_arg<S>(&mut self, arg: S)
     where
         S: AsRef<OsStr>,
     {

@@ -146,7 +146,7 @@ use prost_types::{FileDescriptorProto, FileDescriptorSet};
 
 pub use crate::ast::{Comments, Method, Service};
 use crate::code_generator::CodeGenerator;
-use crate::compile_mode::CompileMode;
+pub use crate::compile_mode::CompileMode;
 use crate::extern_paths::ExternPaths;
 use crate::ident::to_snake;
 use crate::message_graph::MessageGraph;
