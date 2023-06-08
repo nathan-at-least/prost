@@ -29,6 +29,7 @@ multimap = { version = "0.8", default-features = false }
 petgraph = { version = "0.6", default-features = false }
 prost = { version = "0.11.9", path = "..", default-features = false }
 prost-types = { version = "0.11.9", path = "../prost-types", default-features = false }
+protox = { version = "0.3.5", optional = true }
 tempfile = "3"
 lazy_static = "1.4.0"
 regex = { version = "1.5.5", default-features = false, features = ["std", "unicode-bool"] }

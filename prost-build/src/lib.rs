@@ -146,6 +146,7 @@ use prost_types::{FileDescriptorProto, FileDescriptorSet};
 
 pub use crate::ast::{Comments, Method, Service};
 use crate::code_generator::CodeGenerator;
+use crate::compile_mode::CompileMode;
 use crate::extern_paths::ExternPaths;
 use crate::ident::to_snake;
 use crate::message_graph::MessageGraph;
@@ -153,6 +154,7 @@ use crate::path::PathMap;
 
 mod ast;
 mod code_generator;
+mod compile_mode;
 mod extern_paths;
 mod ident;
 mod message_graph;
@@ -253,12 +255,11 @@ pub struct Config {
     out_dir: Option<PathBuf>,
     extern_paths: Vec<(String, String)>,
     default_package_filename: String,
-    protoc_args: Vec<OsString>,
     disable_comments: PathMap<()>,
-    skip_protoc_run: bool,
     include_file: Option<PathBuf>,
     prost_path: Option<String>,
     fmt: bool,
+    compile_mode: CompileMode,
 }
 
 impl Config {
@@ -774,9 +775,19 @@ impl Config {
         self
     }
 
+    /// Deprecated synonym for [Config::skip_protobuf_compilation]
+    #[deprecated = "use `Config::skip_protobuf_compilation`"]
+    pub fn skip_protoc_run(&mut self) -> &mut Self {
+        self.skip_protobuf_compilation()
+    }
+
+    /// Disable protobuf compilation.
+    ///
     /// In combination with with `file_descriptor_set_path`, this can be used to provide a file
-    /// descriptor set as an input file, rather than having prost-build generate the file by calling
-    /// protoc.
+    /// descriptor set as an input file, rather than having prost-build generate the file by delegating
+    /// to a protobuf compiler such as `protoc` or `protox`.
+    ///
+    /// Calling this method forgets any configured `protoc` args.
     ///
     /// In `build.rs`:
     ///
@@ -787,8 +798,8 @@ impl Config {
     ///     .compile_protos(&["src/items.proto"], &["src/"]);
     /// ```
     ///
-    pub fn skip_protoc_run(&mut self) -> &mut Self {
-        self.skip_protoc_run = true;
+    pub fn skip_protobuf_compilation(&mut self) -> &mut Self {
+        self.compile_mode = CompileMode::None;
         self
     }
 
@@ -836,7 +847,18 @@ impl Config {
         self
     }
 
+    /// Use `protox` as the protobuf compiler backend
+    ///
+    /// Any arguments to `protoc` set via [Config::protoc_arg] are silently forgotten.
+    #[cfg(protox)]
+    pub fn use_protox_compiler(&mut self) -> &mut Self {
+        self.compile_mode = CompileMode::Protox;
+        self
+    }
+
     /// Add an argument to the `protoc` protobuf compilation invocation.
+    ///
+    /// This method enables `protoc` compilation, overwriting any previous call to [Config::skip_protobuf_compilation] or `Config::use_protox_compiler`.
     ///
     /// # Example `build.rs`
     ///
@@ -854,7 +876,7 @@ impl Config {
     where
         S: AsRef<OsStr>,
     {
-        self.protoc_args.push(arg.as_ref().to_owned());
+        self.compile_mode.append_protoc_arg(arg);
         self
     }
 
@@ -1017,77 +1039,106 @@ impl Config {
         // this figured out.
         // [1]: http://doc.crates.io/build-script.html#outputs-of-the-build-script
 
-        let tmp;
-        let file_descriptor_set_path = if let Some(path) = &self.file_descriptor_set_path {
-            path.clone()
-        } else {
-            if self.skip_protoc_run {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    "file_descriptor_set_path is required with skip_protoc_run",
-                ));
+        // BUG? We take `compile_mode` which resets it to `Default::default`. Does this API support subsequent [Config] usage after calling this method? If not, maybe the receiver should be changed from `&mut self` -> `mut self`.
+        match std::mem::take(&mut self.compile_mode) {
+            CompileMode::None => self.compile_protos_without_protobuf_compiler(),
+            CompileMode::Protoc { args } => {
+                self.compile_protos_with_protoc(protos, includes, &args[..])
             }
-            tmp = tempfile::Builder::new().prefix("prost-build").tempdir()?;
-            tmp.path().join("prost-descriptor-set")
-        };
+            #[cfg(protox)]
+            CompileMode::Protox => self.compile_protos_with_protox(protos, includes),
+        }
+    }
 
-        if !self.skip_protoc_run {
-            let protoc = protoc_from_env();
+    fn compile_protos_without_protobuf_compiler(&mut self) -> Result<()> {
+        let fds_path = self.file_descriptor_set_path.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Other,
+                "file_descriptor_set_path is required with `skip_protobuf_compilation`",
+            )
+        })?;
 
-            let mut cmd = Command::new(protoc.clone());
-            cmd.arg("--include_imports")
-                .arg("--include_source_info")
-                .arg("-o")
-                .arg(&file_descriptor_set_path);
+        self.compile_fds_path(fds_path.to_path_buf())
+    }
 
-            for include in includes {
-                if include.as_ref().exists() {
-                    cmd.arg("-I").arg(include.as_ref());
-                } else {
-                    debug!(
-                        "ignoring {} since it does not exist.",
-                        include.as_ref().display()
-                    )
-                }
+    fn compile_protos_with_protoc(
+        &mut self,
+        protos: &[impl AsRef<Path>],
+        includes: &[impl AsRef<Path>],
+        protoc_args: &[OsString],
+    ) -> Result<()> {
+        let tmp = tempfile::Builder::new().prefix("prost-build").tempdir()?;
+        let fds_path = tmp.path().join("prost-descriptor-set");
+
+        let protoc = protoc_from_env();
+
+        let mut cmd = Command::new(protoc.clone());
+        cmd.arg("--include_imports")
+            .arg("--include_source_info")
+            .arg("-o")
+            .arg(&fds_path);
+
+        for include in includes {
+            if include.as_ref().exists() {
+                cmd.arg("-I").arg(include.as_ref());
+            } else {
+                debug!(
+                    "ignoring {} since it does not exist.",
+                    include.as_ref().display()
+                )
             }
+        }
 
-            // Set the protoc include after the user includes in case the user wants to
-            // override one of the built-in .protos.
-            if let Some(protoc_include) = protoc_include_from_env() {
-                cmd.arg("-I").arg(protoc_include);
-            }
+        // Set the protoc include after the user includes in case the user wants to
+        // override one of the built-in .protos.
+        if let Some(protoc_include) = protoc_include_from_env() {
+            cmd.arg("-I").arg(protoc_include);
+        }
 
-            for arg in &self.protoc_args {
-                cmd.arg(arg);
-            }
+        for arg in protoc_args {
+            cmd.arg(arg);
+        }
 
-            for proto in protos {
-                cmd.arg(proto.as_ref());
-            }
+        for proto in protos {
+            cmd.arg(proto.as_ref());
+        }
 
-            debug!("Running: {:?}", cmd);
+        debug!("Running: {:?}", cmd);
 
-            let output = cmd.output().map_err(|error| {
+        let output = cmd.output().map_err(|error| {
                 Error::new(
                     error.kind(),
                     format!("failed to invoke protoc (hint: https://docs.rs/prost-build/#sourcing-protoc): (path: {:?}): {}", &protoc, error),
                 )
             })?;
 
-            if !output.status.success() {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!("protoc failed: {}", String::from_utf8_lossy(&output.stderr)),
-                ));
-            }
+        if !output.status.success() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("protoc failed: {}", String::from_utf8_lossy(&output.stderr)),
+            ));
         }
 
-        let buf = fs::read(&file_descriptor_set_path).map_err(|e| {
+        self.compile_fds_path(fds_path)
+    }
+
+    #[cfg(protox)]
+    fn compile_protos_with_protox(
+        &mut self,
+        protos: &[impl AsRef<Path>],
+        includes: &[impl AsRef<Path>],
+    ) -> Result<()> {
+        let file_descriptor_set = protox::compile(protos, includes)?;
+        self.compile_fds(file_descriptor_set)
+    }
+
+    fn compile_fds_path(&mut self, fds_path: PathBuf) -> Result<()> {
+        let buf = fs::read(&fds_path).map_err(|e| {
             Error::new(
                 e.kind(),
                 format!(
                     "unable to open file_descriptor_set_path: {:?}, OS: {}",
-                    &file_descriptor_set_path, e
+                    &fds_path, e
                 ),
             )
         })?;
@@ -1242,12 +1293,11 @@ impl default::Default for Config {
             out_dir: None,
             extern_paths: Vec::new(),
             default_package_filename: "_".to_string(),
-            protoc_args: Vec::new(),
             disable_comments: PathMap::default(),
-            skip_protoc_run: false,
             include_file: None,
             prost_path: None,
             fmt: true,
+            compile_mode: CompileMode::default(),
         }
     }
 }
@@ -1266,9 +1316,9 @@ impl fmt::Debug for Config {
             .field("out_dir", &self.out_dir)
             .field("extern_paths", &self.extern_paths)
             .field("default_package_filename", &self.default_package_filename)
-            .field("protoc_args", &self.protoc_args)
             .field("disable_comments", &self.disable_comments)
             .field("prost_path", &self.prost_path)
+            .field("compile_mode", &self.compile_mode)
             .finish()
     }
 }
